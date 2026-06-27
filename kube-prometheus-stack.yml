@@ -1,0 +1,173 @@
+- name: "Deploy and verify kube-prometheus-stack"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    release_name: monitoring-stack
+    namespace: monitoring
+    chart_ref: prometheus-community/kube-prometheus-stack
+
+
+  tasks:
+  - name: "Task1 | Add the Prometheus Community Helm repository"
+    kubernetes.core.helm_repository:
+      name: prometheus-community
+      repo_url: https://prometheus-community.github.io/helm-charts
+
+  - name: "Task1 | Update repo index and record latest chart version" 
+    ansible.builtin.command: helm search repo prometheus-community/kube-prometheus-stack --output json
+    register: chart_search
+    changed_when: false 
+
+  - name: "Task1 | Show latest available chart version"
+    ansible.builtin.debug:
+      msg: "Latest chart version = {{ (chart_search.stdout | from_json)[0].version }}"
+
+
+  - name: "Task2 | Create the monitoring namespace"
+    kubernetes.core.k8s:
+      api_version: v1
+      kind: Namespace
+      name: "{{ namespace }}"
+      state: present
+
+  - name: "Task3 | Deploy the kube-prometheus-stack chart (wait until ready)"
+    kubernetes.core.helm:
+      name: "{{ release_name }}"
+      chart_ref: "{{ chart_ref }}"
+      release_namespace: "{{ namespace }}"
+      create_namespace: true
+      update_repo_cache: true
+      wait: true
+      timeout: 10m0s
+
+  - name: "Task4 | Collect core workload resources"
+    kubernetes.core.k8s_info:
+      kind: "{{ item }}"
+      namespace: "{{ namespace }}"
+    loop:
+      - Pod
+      - Deployment
+      - StatefulSet
+      - DaemonSet
+      - Service
+      - ConfigMap
+      - Secret
+      - ServiceAccount
+    register: resources
+
+  - name: "Task4 | Show count of each resource type"
+    ansible.builtin.debug:
+      msg: "{{ item.item }} = {{ item.resources | length }}"
+    loop: "{{ resources.results }}"
+    loop_control:
+      label: "{{ item.item }}"
+
+
+  - name: "Task4 | Fail if any Pod is not Running/Succeeded"
+    ansible.builtin.assert:
+      that:
+        - item.status.phase in ['Running', 'Succeeded']
+    loop: "{{ (resources.results | selectattr('item','equalto','Pod') | first).resources }}"
+    loop_control:
+      label: "{{ item.metadata.name }}"
+
+
+  - name: "Task5 | Purpose of each deployed component"
+    ansible.builtin.debug:
+      msg:
+        - "Prometheus Server   : Collects and stores metrics from Kubernetes and monitored applications."
+        - "Grafana             : Provides dashboards and visualizes metrics from Prometheus."
+        - "Alertmanager        : Receives alerts from Prometheus and routes notifications."
+        - "kube-state-metrics  : Exposes Kubernetes object states as Prometheus metrics."
+        - "Prometheus Operator : Manages the lifecycle and configuration of Prometheus and Alertmanager."
+        - "Node Exporter       : Runs as a DaemonSet to collect node-level system metrics."
+        - "Admission Webhooks  : Validates and mutates Prometheus Operator custom resources before creation."
+        - "Task6 | Get the Helm release info"
+
+  - name: "Task6 | Get the Helm release info"
+    kubernetes.core.helm_info:
+      name: "{{ release_name }}"
+      release_namespace: "{{ namespace }}"
+    register: release_info
+ 
+  - name: "Task6 | Show release summary"
+    ansible.builtin.debug:
+      msg: >-
+        Release={{ release_info.status.name }}
+        Namespace={{ release_info.status.namespace }}
+        Chart={{ release_info.status.chart }}
+        Revision={{ release_info.status.revision }}
+        Status={{ release_info.status.status }}
+
+
+  - name: "Task7 | Retrieve the Grafana admin password"
+    kubernetes.core.k8s_info:
+      kind: Secret
+      name: "{{ release_name }}-grafana"
+      namespace: "{{ namespace }}"
+    register: grafana_secret
+ 
+  - name: "Task7 | Show Grafana login"
+    ansible.builtin.debug:
+      msg:
+        - "Grafana user: admin"
+        - "Grafana pass: {{ grafana_secret.resources[0].data['admin-password'] | b64decode }}"
+
+  - name: "Task8 | How to expose Prometheus UI"
+    ansible.builtin.debug:
+      msg: >-
+        kubectl port-forward -n {{ namespace }}
+        svc/{{ release_name }}-kube-prom-prometheus 9090:9090
+ 
+  - name: "Task9 | Expected scrape targets to verify as UP"
+    ansible.builtin.debug:
+      msg:
+        - "Kubernetes API Server / kubelet / CoreDNS"
+        - "kube-state-metrics / Node Exporter"
+        - "Prometheus Operator / Prometheus Server"
+        - "Verify using PromQL query: up (1 = UP, 0 = DOWN)"
+
+  - name: "Task10 | List CRDs installed by the Prometheus Operator"
+    kubernetes.core.k8s_info:
+      kind: CustomResourceDefinition
+    register: crds
+ 
+  - name: "Task10 | Show monitoring.coreos.com CRDs"
+    ansible.builtin.debug:
+      msg: "{{ crds.resources | map(attribute='metadata.name') | select('search','monitoring.coreos.com') | list }}"
+
+
+  - name: "Task11 | Create demo namespace"
+    kubernetes.core.k8s:
+      api_version: v1
+      kind: Namespace
+      name: demo
+      state: present
+ 
+  - name: "Task11 | Deploy a sample nginx app"
+    kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: web
+          namespace: demo
+        spec:
+          replicas: 2
+          selector:
+            matchLabels: { app: web }
+          template:
+            metadata:
+              labels: { app: web }
+            spec:
+              containers:
+                - name: nginx
+                  image: nginx
+                  ports:
+                    - containerPort: 80
+
+
+
+
